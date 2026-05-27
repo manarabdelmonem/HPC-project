@@ -1,0 +1,6 @@
+# MPI hostfile — 3-node cluster
+# Tutorial specifies 2 slots per node → 6 total MPI processes
+# Run with: mpirun -np 6 --hostfile hostfile python3 <script>
+master  slots=2
+worker1 slots=2
+worker2 slots=2
