@@ -1,68 +1,87 @@
 # distributed_gene_analysis.py
-# Task 1 – Distributed Bioinformatics ML on Leukemia Gene Expression Data (MPI)
+# Task 1b – Distributed ML on the REAL Golub Leukemia Gene Expression Dataset
 #
-# Dataset: bioinfo_data/leukemia_expression.csv
-#   200 samples × 500 gene features  |  Label: 0 = AML, 1 = ALL
+# ── DATASET SETUP ─────────────────────────────────────────────────────────────
+# Download from: https://www.kaggle.com/datasets/crawford/gene-expression
+# You will get 3 files — place all three in the same folder as this script:
 #
-# Cluster specs:
-#   master   192.168.56.10  5 GB RAM  5 cores  Rank 0
-#   worker1  192.168.56.11  4 GB RAM  4 cores  Rank 1
-#   worker2  192.168.56.12  4 GB RAM  3 cores  Rank 2
+#   data_set_ALL_AML_train.csv       ← training gene expression (7129 genes × 38 patients)
+#   data_set_ALL_AML_independent.csv ← test gene expression     (7129 genes × 34 patients)
+#   actual.csv                       ← labels for all 72 patients (patient, cancer)
 #
-# How to run (from master):
-#   source ~/venvs/hpc_ml/bin/activate
-#   mpirun -np 6 --hostfile hostfile python3 distributed_gene_analysis.py
+# NOTE: The Kaggle files are TRANSPOSED — genes are rows, patients are columns.
+#       This script handles that automatically.
+#
+# Run:  mpirun -np 6 --hostfile hostfile python3 distributed_gene_analysis.py
 
 from mpi4py import MPI
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
 import numpy as np
+from sklearn.ensemble import RandomForestClassifier
 
-# ── Initialize MPI communication ─────────────────────────────────────────────
+# ── MPI init ─────────────────────────────────────────────────────────────────
 comm = MPI.COMM_WORLD
-rank = comm.Get_rank()   # this process's rank
-size = comm.Get_size()   # total number of MPI processes
+rank = comm.Get_rank()
+size = comm.Get_size()
 
-# ── Rank 0 loads the CSV; others wait ────────────────────────────────────────
+# ── Rank 0 loads and prepares the real Kaggle dataset ─────────────────────────
 if rank == 0:
-    df     = pd.read_csv("bioinfo_data/leukemia_expression.csv")
-    # All columns except the last are gene expression features
-    data   = df.iloc[:, 1:-1].values.astype(float)   # drop sample_id col
-    # Last column is the class label (0=AML, 1=ALL)
-    target = df.iloc[:, -1].values.astype(int)
-    print(f"[Rank 0] Dataset loaded: {data.shape[0]} samples, {data.shape[1]} genes")
-    print(f"[Rank 0] Class counts — AML: {(target==0).sum()}, ALL: {(target==1).sum()}")
+    print("[Rank 0] Loading real Golub leukemia dataset ...")
+
+    # ── Load gene expression files (genes as rows, patients as columns) ────────
+    df_train = pd.read_csv("data_set_ALL_AML_train.csv")
+    df_test  = pd.read_csv("data_set_ALL_AML_independent.csv")
+
+    # The Kaggle files have extra columns: 'Gene Description', 'Gene Accession Number'
+    # and alternating 'call' columns (A/M/P flags). We only want numeric expression columns.
+    def extract_expression(df):
+        # Keep only columns that are purely numeric patient columns (not 'call' columns)
+        expr_cols = [c for c in df.columns
+                     if c not in ("Gene Description", "Gene Accession Number")
+                     and "call" not in str(c).lower()]
+        return df[expr_cols].T   # Transpose: rows=patients, cols=genes
+
+    train_expr = extract_expression(df_train)   # shape: (38, 7129)
+    test_expr  = extract_expression(df_test)    # shape: (34, 7129)
+
+    # Combine train + test into full dataset (72 patients total)
+    X = pd.concat([train_expr, test_expr], axis=0).values.astype(float)
+
+    # ── Load labels ─────────────────────────────────────────────────────────────
+    labels_df = pd.read_csv("actual.csv")
+    # actual.csv columns: 'patient' (1-72), 'cancer' ('ALL' or 'AML')
+    labels_df = labels_df.sort_values("patient").reset_index(drop=True)
+    y = labels_df["cancer"].map({"ALL": 0, "AML": 1}).values   # ALL=0, AML=1
+
+    print(f"[Rank 0] Dataset: {X.shape[0]} patients × {X.shape[1]} genes")
+    print(f"[Rank 0] Labels — ALL: {(y==0).sum()}, AML: {(y==1).sum()}")
 else:
-    data   = None
-    target = None
+    X = None
+    y = None
 
-# ── Broadcast full dataset to all ranks ──────────────────────────────────────
-data   = comm.bcast(data,   root=0)
-target = comm.bcast(target, root=0)
+# ── Broadcast to all ranks ────────────────────────────────────────────────────
+X = comm.bcast(X, root=0)
+y = comm.bcast(y, root=0)
 
-# ── Each rank computes its own contiguous chunk of samples ───────────────────
-chunk_size  = len(data) // size
-start       = rank * chunk_size
-# Last rank takes any leftover samples
-end         = start + chunk_size if rank != size - 1 else len(data)
-local_data   = data[start:end]
-local_target = target[start:end]
+# ── Each rank takes its own patient slice ─────────────────────────────────────
+chunk = len(X) // size
+start = rank * chunk
+end   = start + chunk if rank != size - 1 else len(X)
+X_local = X[start:end]
+y_local = y[start:end]
 
 print(f"[Rank {rank} | {MPI.Get_processor_name()}]  "
-      f"Training on samples {start}–{end-1}  ({len(local_data)} samples)")
+      f"Training on {len(X_local)} patients, {X.shape[1]} genes ...")
 
-# ── Each rank trains a local Random Forest on its chunk ───────────────────────
+# ── Train Random Forest on local shard ────────────────────────────────────────
 clf = RandomForestClassifier(n_estimators=100, random_state=42)
-clf.fit(local_data, local_target)
-
-# ── Score locally on the same chunk ──────────────────────────────────────────
-local_score = clf.score(local_data, local_target)
+clf.fit(X_local, y_local)
+local_score = clf.score(X_local, y_local)
 print(f"[Rank {rank}]  Local score: {local_score:.4f}")
 
-# ── Gather all local scores at rank 0 ────────────────────────────────────────
+# ── Gather all scores at rank 0 ───────────────────────────────────────────────
 scores = comm.gather(local_score, root=0)
 
-# ── Rank 0 prints the aggregated results ─────────────────────────────────────
 if rank == 0:
     print("\n" + "="*50)
     print("Bioinformatics scores from all nodes:", [f"{s:.4f}" for s in scores])
